@@ -6,6 +6,7 @@ import path from "path";
 import { create, fragment } from "xmlbuilder2";
 import { toXmlDate } from "./time";
 import { XMLBuilder } from "xmlbuilder2/lib/interfaces";
+import { styles } from "./styles";
 
 // [Container file is required to be located here](https://www.w3.org/TR/epub-33/#sec-container-metainf-container.xml)
 const OCF_CONTAINER_PATH = "META-INF/container.xml";
@@ -30,6 +31,13 @@ export interface EpubResource {
 
   /** Whether this resource should be included in the spine (which specifies the order of the content). */
   includeInSpine?: boolean;
+}
+
+interface ChapterInfo {
+  /** The zero-based index of the chapter in the ePub. */
+  index: number;
+
+  content: EpubContent;
 }
 
 /** The primary write logic lives here. */
@@ -151,25 +159,103 @@ export class EpubWriter {
     return doc.doc().end({ prettyPrint: true });
   }
 
-  protected addResource(resource: EpubResource, requiredBy: string) {
+  protected hasResource(filename: string): boolean {
+    return this.resources.hasNode(filename);
+  }
+
+  // Upserts the provided resource.
+  protected addResource(
+    resource: EpubResource,
+    requiredBy: string,
+  ): EpubResource {
     const id = resource.filename;
-    if (this.resources.hasNode(id)) {
+    // TODO: deep equals compare.
+    /*
+    if (this.hasResource(resource.filename)) {
       throw new Error(
         `cannot add duplicate resource named '${resource.filename}' to epub`,
       );
     }
+    */
 
-    this.resources.addNode(id, resource);
+    if (!this.hasResource(resource.filename)) {
+      this.resources.addNode(id, resource);
+    } else {
+      const existingResource = this.resources.getNodeData(id);
+
+      if (existingResource.mimetype !== resource.mimetype) {
+        throw new Error(
+          `cannot add duplicate resource named '${resource.filename}' with different mimetype to epub`,
+        );
+      }
+
+      // Merge all other properties.
+      this.resources.setNodeData(id, {
+        ...existingResource,
+        ...resource,
+      });
+    }
+
     this.resources.addDependency(requiredBy, id);
+
+    return resource;
+  }
+
+  protected addCssResource(
+    filename: string,
+    contents: string,
+    requiredBy: string,
+  ) {
+    return this.addResource(
+      {
+        filename,
+        mimetype: "text/css",
+        contents,
+      },
+      requiredBy,
+    );
   }
 
   protected addHtmlResource(
     filename: string,
     contents: XMLBuilder,
-    resource: Partial<EpubResource> = {},
+    resource: Partial<EpubResource> & { styles?: Record<string, string> } = {},
   ) {
-    // TODO: extract dependent files
-    this.addResource(
+    if (!this.hasResource(filename)) {
+      // Add a placeholder HTML resource to ensure the CSS resources have something to reference.
+      this.addResource(
+        {
+          filename,
+          mimetype: "application/xhtml+xml",
+          contents: "",
+          ...resource,
+        },
+        this.packageDocumentPath,
+      );
+    }
+
+    const { styles } = resource;
+
+    // Add CSS link tags to the head of the HTML document
+    const head = contents.find(
+      (node) => node.node.nodeName === "head",
+      false,
+      true,
+    );
+    if (head && styles) {
+      const linkTags = fragment();
+
+      for (const [name, css] of Object.entries(styles)) {
+        const cssFilename = path.join(this.metadataRootPath, `${name}.css`);
+        const relativePath = path.relative(path.dirname(filename), cssFilename);
+        this.addCssResource(cssFilename, css, filename);
+        linkTags.ele("link", { rel: "stylesheet", href: relativePath });
+      }
+
+      head.import(linkTags);
+    }
+
+    return this.addResource(
       {
         filename,
         mimetype: "application/xhtml+xml",
@@ -180,28 +266,26 @@ export class EpubWriter {
     );
   }
 
-  protected getChapterIndex(chapter: EpubContent): number {
-    const index = this.document.chapters.indexOf(chapter);
-    if (index === -1) {
-      throw new Error(`chapter not found in document: ${chapter.title}`);
-    }
-    return index;
+  /** Returns the zero-based index of the chapter in the ePub. */
+  protected getChapterIndex(info: ChapterInfo): number {
+    return info.index;
   }
 
-  protected getChapterTitle(chapter: EpubContent): string {
-    return chapter.title ?? `Chapter ${this.getChapterIndex(chapter) + 1}`;
+  protected getChapterTitle(info: ChapterInfo): string {
+    // TODO: translate this to the language of the ePub.
+    return info.content.title ?? `Chapter ${this.getChapterIndex(info) + 1}`;
   }
 
   /** A unique ID for the chapter. */
-  protected getChapterId(chapter: EpubContent): string {
-    return `chapter-${this.getChapterIndex(chapter) + 1}`;
+  protected getChapterId(info: ChapterInfo): string {
+    return `chapter-${this.getChapterIndex(info) + 1}`;
   }
 
   /** The path to the chapter's XHTML file, relative to the ePub root. */
-  protected getChapterPath(chapter: EpubContent): string {
+  protected getChapterPath(info: ChapterInfo): string {
     return path.join(
       this.contentRootPath,
-      `chapter-${this.getChapterIndex(chapter) + 1}.xhtml`,
+      `chapter-${this.getChapterIndex(info) + 1}.xhtml`,
     );
   }
 
@@ -217,20 +301,22 @@ export class EpubWriter {
     const nav = fragment().ele("nav", { "epub:type": "toc", id: IDREF.nav });
 
     // TODO: translate this to the language of the ePub.
-    nav.ele("h2").txt("Table of Contents");
+    //nav.ele("h2", { class: "toc__title" }).txt("Table of Contents");
 
     const contentsList = nav.ele("ol", { id: IDREF.navOl });
 
-    this.document.chapters.forEach((chapter) => {
+    this.document.chapters.forEach((content, index) => {
+      const info: ChapterInfo = {
+        index,
+        content,
+      };
+
       contentsList
-        .ele("li", { id: this.getChapterId(chapter) })
+        .ele("li", { id: this.getChapterId(info) })
         .ele("a", {
-          href: path.relative(
-            navigationDirectory,
-            this.getChapterPath(chapter),
-          ),
+          href: path.relative(navigationDirectory, this.getChapterPath(info)),
         })
-        .txt(this.getChapterTitle(chapter));
+        .txt(this.getChapterTitle(info));
     });
 
     const doc = create()
@@ -256,17 +342,20 @@ export class EpubWriter {
     this.addHtmlResource(this.navigationPath, doc.doc(), {
       properties: "nav",
       includeInSpine: true,
+      styles: {
+        global: styles.global,
+        navigation: styles.navigation,
+      },
     });
   }
 
-  protected addChapter(chapter: EpubContent) {
-    const content = fragment(`<main>${chapter.content}</main>`);
+  protected addChapter(info: ChapterInfo) {
+    const chapterPath = this.getChapterPath(info);
 
-    const head = fragment()
-      .ele("head")
-      .ele("title")
-      .txt(this.getChapterTitle(chapter))
-      .up();
+    const content = fragment(`<main>${info.content.content}</main>`);
+    const head = fragment().ele("head");
+
+    head.ele("title").txt(this.getChapterTitle(info));
 
     const doc = create()
       .ele("html", {
@@ -275,19 +364,30 @@ export class EpubWriter {
         "xml:lang": this.document.language,
         lang: this.document.language,
       })
-      .import(head)
-      .ele("body")
-      .import(content);
+      .import(head);
 
-    this.addHtmlResource(this.getChapterPath(chapter), doc.doc(), {
-      id: this.getChapterId(chapter),
+    const body = doc.ele("body");
+    body
+      .ele("header", { class: "chapter" })
+      .ele("h1", { class: "chapter__title" })
+      .txt(this.getChapterTitle(info));
+
+    body.import(content);
+
+    const chapter = this.addHtmlResource(chapterPath, doc.doc(), {
+      id: this.getChapterId(info),
       includeInSpine: true,
+
+      styles: {
+        global: styles.global,
+        content: styles.content,
+      },
     });
   }
 
   protected addContent() {
-    this.document.chapters.forEach((chapter) => {
-      this.addChapter(chapter);
+    this.document.chapters.forEach((content, index) => {
+      this.addChapter({ index, content });
     });
   }
 
@@ -299,23 +399,27 @@ export class EpubWriter {
       lang: this.document.language,
     });
 
-    doc.ele("head").ele("title").txt(this.document.title);
+    const coverPath = path.join(this.metadataRootPath, "cover.xhtml");
+
+    const head = doc.ele("head");
+    head.ele("title").txt(this.document.title);
 
     doc
       .ele("body")
-      .ele("h1")
+      .ele("header", { class: "cover" })
+      .ele("h1", { class: "cover__title" })
       .txt(this.document.title)
       .up()
-      .ele("h2")
+      .ele("h2", { class: "cover__author" })
       .txt(this.document.author);
 
-    this.addHtmlResource(
-      path.join(this.metadataRootPath, "cover.xhtml"),
-      doc.doc(),
-      {
-        includeInSpine: true,
+    this.addHtmlResource(coverPath, doc.doc(), {
+      includeInSpine: true,
+      styles: {
+        global: styles.global,
+        cover: styles.cover,
       },
-    );
+    });
   }
 
   /** Collects and adds all resource files we need in this ePub. */
@@ -323,7 +427,9 @@ export class EpubWriter {
     this.resources.addNode(this.packageDocumentPath, undefined);
 
     this.addCover();
+
     this.addNavigation();
+
     this.addContent();
   }
 
